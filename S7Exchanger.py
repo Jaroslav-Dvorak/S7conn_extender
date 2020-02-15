@@ -1,60 +1,142 @@
-import snap7
 from time import time, sleep
 # from snap7.snap7types import areas
+import configparser
+import platform
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+import snap7
 
-# TODO:
-#     - config.ini
-#     - connection handler
-#     - paralelize
+Config = configparser.ConfigParser()
+Config.read("config.ini")
+
+PLCs = {}
+for section in Config.sections():
+    PLCs[section] = dict(Config[section])
+
+VirtPLC_IP = PLCs.pop("VIRT_PLC")["ip"]
+
+
+def address_parser(address, name):
+    """
+    splits S7 address into dict
+    """
+    address = address.split(".")
+    outdict = {}
+    if address[0].lower().startswith("db"):
+        outdict[name+"_AREA"] = "DB"
+        outdict[name+"_DB"] = int(address[0][2:])
+        outdict[name+"_ADDR"] = int(address[1][3:])
+        if "BYTE" in address[2]:
+            outdict[name+"_SIZE"] = int(address[2].split()[2])
+    return outdict
+
+
+for PLC in PLCs:
+    TYPE = PLCs[PLC].pop("type")
+    IP = PLCs[PLC]["ip"]
+    if TYPE == "1200" or TYPE == "1500":
+        PLCs[PLC]["conntupple"] = (IP, 0, 1)
+    elif TYPE == "300" or TYPE == "400":
+        PLCs[PLC]["conntupple"] = (IP, 0, 2)
+    elif TYPE.lower() == "logo":
+        PLCs[PLC]["conntupple"] = (IP, 0, 0)
+
+    transmit = ("phys_source", "virt_source", "virt_dest", "phys_dest")
+    for a in transmit:
+        PLCs[PLC].update(address_parser(PLCs[PLC].pop(a), a))
+
+    PLCs[PLC]["conn_attempts"] = 3
+
 
 Areas = {
-        'IB': 0x81,
-        'QB': 0x82,
-        'MB': 0x83,
-        'DBB': 0x84,
+        'I': 0x81,
+        'Q': 0x82,
+        'M': 0x83,
+        'DB': 0x84,
         'CT': 0x1C,
         'TM': 0x1D,
         }
 
-Connections = {
-                # ("R_1", 1): ("10.40.1.1", 0, 1),
-                ("R_2", 2): ("10.40.2.1", 0, 1),
-                ("R_3", 3): ("10.40.3.1", 0, 1),
-                ("R_4", 4): ("10.40.4.1", 0, 1),
-                ("R_5", 5): ("10.40.5.1", 0, 1),
-                ("R_6", 6): ("10.40.6.1", 0, 1),
-                ("R_7", 7): ("10.40.7.1", 0, 1),
-                # ("R_8", 8): ("10.40.8.1", 0, 1),
-                # ("R_9", 9): ("10.40.9.1", 0, 1),
-                # ("R_10", 10): ("10.40.10.1", 0, 1),
-               }
 
-# Snap7Server_con = ("10.32.65.3", 0, 2)
-Snap7Server_con = ("10.0.0.3", 0, 2)
+def ping(host):
+    """
+    Returns True if host (str) responds to a ping request.
+    """
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
+    command = ['ping', param, '1', host]
+    return subprocess.call(command, stdout=subprocess.PIPE) == 0
+
+
 VirtPLC = snap7.client.Client()
-VirtPLC.connect(*Snap7Server_con)
+try:
+    VirtPLC.connect(VirtPLC_IP, 0, 2)
+except Exception as e:
+    del e
+    print("Virtual PLC server unavaible.")
+    exit()
 
 
-def db200_to_virtPLC(source_conn, virt_plc, db):
+def online_checker():
+    """
+    Determines if PLC is avaible on network.
+    """
+    while True:
+        for plc in PLCs.values():
+            if plc["conn_attempts"] >= 3:
+                if ping(plc["ip"]):
+                    plc["conn_attempts"] = 0
+        sleep(0.1)
+
+
+def exchanger(params):
+    """
+    Connects to PLC and exchanges data between VirtPLC and Physical PLC.
+    """
     plc = snap7.client.Client()
-    plc.connect(*source_conn)
+    plc.connect(*params["conntupple"])
 
-    data = plc.read_area(area=Areas["DBB"], dbnumber=200, start=0, size=49)
-    virt_plc.write_area(area=Areas["DBB"], dbnumber=db, start=0, data=data)
+    data = plc.read_area(area=Areas[params["phys_source_AREA"]],
+                         dbnumber=params["phys_source_DB"],
+                         start=params["phys_source_ADDR"],
+                         size=params["phys_source_SIZE"])
+    VirtPLC.write_area(area=Areas[params["virt_dest_AREA"]],
+                       dbnumber=params["virt_dest_DB"],
+                       start=params["virt_dest_ADDR"],
+                       data=data)
 
-    data = virt_plc.read_area(area=Areas["DBB"], dbnumber=db, start=50, size=1)
-    plc.write_area(area=Areas["DBB"], dbnumber=200, start=50, data=data)
-    # virt_plc.write_area(area=Areas["DBB"], dbnumber=db, start=50, data=bytes(chr(0), "utf-8"))
+    data = VirtPLC.read_area(area=Areas[params["virt_source_AREA"]],
+                             dbnumber=params["virt_source_DB"],
+                             start=params["virt_source_ADDR"],
+                             size=params["virt_source_SIZE"])
+    plc.write_area(area=Areas[params["phys_dest_AREA"]],
+                   dbnumber=params["phys_dest_DB"],
+                   start=params["phys_dest_ADDR"],
+                   data=data)
+
     plc.disconnect()
     plc.destroy()
 
 
-while True:
-    stime = time()
-    for ID, conn in Connections.items():
-        try:
-            db200_to_virtPLC(conn, VirtPLC, ID[1])
-        except Exception as e:
-            pass
-    # print("time:", time()-stime)
-    sleep(1)
+def exchanging():
+    """
+    Try to start exchane data, if failed three times - switch to online_checker.
+    Prints time of one cycle of exchange all physical PLC configured.
+    """
+    while True:
+        stime = time()
+        for plc in PLCs.values():
+            if plc["conn_attempts"] < 3:
+                try:
+                    exchanger(params=plc)
+                except Exception as e:
+                    plc["conn_attempts"] += 1
+                else:
+                    plc["conn_attempts"] = 0
+        print("time:", time()-stime)
+        sleep(0.5)
+
+
+if __name__ == '__main__':
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        executor.submit(exchanging)
+        executor.submit(online_checker)
